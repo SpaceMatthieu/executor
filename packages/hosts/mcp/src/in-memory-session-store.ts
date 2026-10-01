@@ -2,7 +2,11 @@ import { Cause, Data, Effect, Layer } from "effect";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 
-import { formatPausedExecution, type ExecutionEngine } from "@executor-js/execution";
+import {
+  formatPausedExecution,
+  type ExecutionEngine,
+  type ResumeResponse,
+} from "@executor-js/execution";
 import type { Executor, OrgWriteAccess } from "@executor-js/sdk";
 
 import {
@@ -33,7 +37,12 @@ import {
   type Principal,
   type McpResource,
 } from "./seams";
-import type { BrowserApprovalStore, McpPassthroughUnavailableError } from "./tool-server";
+import {
+  formatMcpExecutionOutcome,
+  type BrowserApprovalStore,
+  type McpPassthroughUnavailableError,
+  type ResumeFallbackOutcome,
+} from "./tool-server";
 
 // ---------------------------------------------------------------------------
 // In-process McpSessionStore — the single-node serving store, shared by every
@@ -112,6 +121,16 @@ export interface McpBuildServerOptions {
     | { readonly mode: "model" }
     | { readonly mode: "native" };
   readonly browserApprovalStore?: BrowserApprovalStore;
+  /**
+   * Optional model-resume fallback that routes a resume miss in THIS session
+   * to another live session owned by the same principal. Mirrors the option
+   * used by Cloudflare's Durable Object host so the tool-server can reuse the
+   * same resume fallback wiring.
+   */
+  readonly resumeFallback?: (
+    executionId: string,
+    response: ResumeResponse,
+  ) => Effect.Effect<ResumeFallbackOutcome | null, unknown>;
   /** Whether this session serves artifacts. True unless the client connected
    *  with `?artifacts=false`; opted out, the built server registers none of
    *  the artifact tools, resource, or skills. */
@@ -412,9 +431,61 @@ export const makeInMemoryMcpSessionStore = (
    * at the request origin + the session id, minted on initialize) and the shared
    * approval store. Otherwise pass the bare model/native mode through.
    */
+  /**
+   * Build a model-resume fallback that, on a local miss, scans other live
+   * in-memory sessions to find and resume the paused execution for the same
+   * principal (account + organization). If the paused execution belongs to a
+   * different principal, report `execution_forbidden`. If no session holds it,
+   * return null so the caller renders `execution_not_found`.
+   */
+  const makeResumeFallback = (
+    currentPrincipal: Principal,
+    currentSessionId: () => string | null,
+  ): McpBuildServerOptions["resumeFallback"] => {
+    return (executionId, response) =>
+      Effect.gen(function* () {
+        // Snapshot the session ids to avoid iterator invalidation during async effects.
+        const sessionIds = Array.from(engines.keys());
+        const selfId = currentSessionId();
+        for (const sid of sessionIds) {
+          // Skip the current session: the tool-server already attempted a local resume.
+          if (sid === selfId) continue;
+          const engine = engines.get(sid);
+          const owner = owners.get(sid);
+          if (!engine || !owner) continue;
+          // Does this session hold the paused execution?
+          const paused = yield* engine.getPausedExecution(executionId);
+          if (!paused) continue;
+          // Found a paused execution — enforce principal ownership across sessions.
+          if (!principalOwns(owner.principal, currentPrincipal)) {
+            return { status: "execution_forbidden" as const } satisfies ResumeFallbackOutcome;
+          }
+          // Attempt the resume on the owning session's engine.
+          const outcome = yield* engine.resume(executionId, response);
+          if (outcome) {
+            return {
+              status: "result" as const,
+              result: formatMcpExecutionOutcome(outcome),
+            } satisfies ResumeFallbackOutcome;
+          }
+          // Race: the pause disappeared. Prefer "already_settled" when the engine remembers it.
+          const settled =
+            (yield* engine.isExecutionSettled
+              ? engine.isExecutionSettled(executionId)
+              : Effect.succeed(false)) === true;
+          return settled
+            ? ({ status: "execution_already_settled" as const } satisfies ResumeFallbackOutcome)
+            : ({ status: "execution_not_found" as const } satisfies ResumeFallbackOutcome);
+        }
+        // No live session knows about this execution id.
+        return null;
+      });
+  };
+
   const buildOptionsFor = (
     request: Request,
     sessionId: () => string | null,
+    principal: Principal,
   ): McpBuildServerOptions => {
     const artifactsEnabled = readArtifactsEnabled(request);
     const searchToolsEnabled = readSearchToolsEnabled(request);
@@ -426,7 +497,11 @@ export const makeInMemoryMcpSessionStore = (
     };
     const mode = readElicitationMode(request);
     if (mode !== "browser") {
-      return { ...surface, elicitationMode: { mode } };
+      return {
+        ...surface,
+        elicitationMode: { mode },
+        resumeFallback: makeResumeFallback(principal, sessionId),
+      };
     }
     return {
       ...surface,
@@ -442,6 +517,7 @@ export const makeInMemoryMcpSessionStore = (
           }),
       },
       browserApprovalStore: approvals.store,
+      resumeFallback: makeResumeFallback(principal, sessionId),
     };
   };
 
@@ -453,7 +529,7 @@ export const makeInMemoryMcpSessionStore = (
   ): Effect.Effect<McpDispatchResult> => {
     let createdSessionId: string | null = null;
     return buildServer(principal, {
-      ...buildOptionsFor(request, () => createdSessionId),
+      ...buildOptionsFor(request, () => createdSessionId, principal),
       resource,
     }).pipe(
       Effect.flatMap(({ mcpServer, engine, executor, close }) =>
