@@ -238,6 +238,164 @@ it("keeps overlapping warm-session workspace writes bound to their request roles
   await Effect.runPromise(executor.close());
 });
 
+it("model resume fallback finds owner session and resumes across sessions for same principal", async () => {
+  const executionId = "exec_owner_resume";
+  const pausedExecution = {
+    id: executionId,
+    elicitationContext: {
+      address: ToolAddress.make("executor.coreTools.policies.create"),
+      args: { owner: "org", pattern: "x", action: "block" },
+      request: FormElicitation.make({ message: "Approve?", requestedSchema: {} }),
+    },
+  };
+  const ownerEngine: ExecutionEngine = {
+    execute: () => Effect.succeed({ result: "unused" }),
+    executeWithPause: () => Effect.succeed({ status: "completed", result: { result: "unused" } }),
+    resume: (id) =>
+      id === executionId
+        ? Effect.succeed({ status: "completed", result: { result: "owner-resumed" } })
+        : Effect.succeed(null),
+    getPausedExecution: (id) => Effect.succeed(id === executionId ? pausedExecution : null),
+    pausedExecutionCount: () => Effect.succeed(1),
+    hasPausedExecutions: () => Effect.succeed(true),
+    getDescription: Effect.succeed("owner engine"),
+    shutdown: Effect.void,
+  };
+  const blindEngine: ExecutionEngine = {
+    execute: () => Effect.succeed({ result: "unused" }),
+    executeWithPause: () => Effect.succeed({ status: "completed", result: { result: "unused" } }),
+    resume: () => Effect.succeed(null),
+    getPausedExecution: () => Effect.succeed(null),
+    pausedExecutionCount: () => Effect.succeed(0),
+    hasPausedExecutions: () => Effect.succeed(false),
+    getDescription: Effect.succeed("blind engine"),
+    shutdown: Effect.void,
+  };
+  let buildCount = 0;
+  const sessions = makeInMemoryMcpSessionStore((_principal, options) => {
+    buildCount += 1;
+    const engine = buildCount === 1 ? ownerEngine : blindEngine;
+    return createExecutorMcpServer({ engine, ...options }).pipe(
+      Effect.map((mcpServer) => ({ mcpServer, engine })),
+    );
+  });
+  // Open two sessions for the SAME principal: owner first, then the resumer.
+  const sessionOwner = await openSession(sessions, TEST_PRINCIPAL);
+  expect(sessionOwner).toBeTruthy();
+  const sessionResumer = await openSession(sessions, TEST_PRINCIPAL);
+  expect(sessionResumer).toBeTruthy();
+
+  const resumeResponse = (await Effect.runPromise(
+    sessions.store.dispatch({
+      request: new Request("https://executor.test/mcp", {
+        method: "POST",
+        headers: { ...MCP_POST_HEADERS, "mcp-session-id": sessionResumer },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/call",
+          params: {
+            name: "resume",
+            arguments: { executionId, action: "accept", content: "{}" },
+          },
+        }),
+      }),
+      principal: TEST_PRINCIPAL,
+      resource: defaultMcpResource,
+      sessionId: sessionResumer,
+      method: "POST",
+    }),
+  )) as Response;
+  expect(resumeResponse.status).toBe(200);
+  const body = (await resumeResponse.json()) as {
+    result?: { structuredContent?: { status?: string; result?: unknown } };
+  };
+  expect(body.result?.structuredContent?.status).toBe("completed");
+  expect(body.result?.structuredContent?.result).toBe("owner-resumed");
+
+  await sessions.close();
+});
+
+it("model resume fallback rejects cross-session resume from a different principal", async () => {
+  const executionId = "exec_forbidden";
+  const pausedExecution = {
+    id: executionId,
+    elicitationContext: {
+      address: ToolAddress.make("executor.coreTools.policies.create"),
+      args: { owner: "org", pattern: "x", action: "block" },
+      request: FormElicitation.make({ message: "Approve?", requestedSchema: {} }),
+    },
+  };
+  const ownerEngine: ExecutionEngine = {
+    execute: () => Effect.succeed({ result: "unused" }),
+    executeWithPause: () => Effect.succeed({ status: "completed", result: { result: "unused" } }),
+    resume: () => Effect.succeed({ status: "completed", result: { result: "ok" } }),
+    getPausedExecution: (id) => Effect.succeed(id === executionId ? pausedExecution : null),
+    pausedExecutionCount: () => Effect.succeed(1),
+    hasPausedExecutions: () => Effect.succeed(true),
+    getDescription: Effect.succeed("owner engine"),
+    shutdown: Effect.void,
+  };
+  const blindEngine: ExecutionEngine = {
+    execute: () => Effect.succeed({ result: "unused" }),
+    executeWithPause: () => Effect.succeed({ status: "completed", result: { result: "unused" } }),
+    resume: () => Effect.succeed(null),
+    getPausedExecution: () => Effect.succeed(null),
+    pausedExecutionCount: () => Effect.succeed(0),
+    hasPausedExecutions: () => Effect.succeed(false),
+    getDescription: Effect.succeed("blind engine"),
+    shutdown: Effect.void,
+  };
+  let buildCount = 0;
+  const sessions = makeInMemoryMcpSessionStore((_principal, options) => {
+    buildCount += 1;
+    const engine = buildCount === 1 ? ownerEngine : blindEngine;
+    return createExecutorMcpServer({ engine, ...options }).pipe(
+      Effect.map((mcpServer) => ({ mcpServer, engine })),
+    );
+  });
+  // Owner session belongs to TEST_PRINCIPAL; resumer belongs to a DIFFERENT principal.
+  const sessionOwner = await openSession(sessions, TEST_PRINCIPAL);
+  expect(sessionOwner).toBeTruthy();
+  const OTHER_PRINCIPAL: Principal = {
+    ...TEST_PRINCIPAL,
+    accountId: "acct_other",
+    email: "other@example.com",
+  };
+  const sessionResumer = await openSession(sessions, OTHER_PRINCIPAL);
+  expect(sessionResumer).toBeTruthy();
+
+  const resumeResponse = (await Effect.runPromise(
+    sessions.store.dispatch({
+      request: new Request("https://executor.test/mcp", {
+        method: "POST",
+        headers: { ...MCP_POST_HEADERS, "mcp-session-id": sessionResumer },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 4,
+          method: "tools/call",
+          params: {
+            name: "resume",
+            arguments: { executionId, action: "accept", content: "{}" },
+          },
+        }),
+      }),
+      principal: OTHER_PRINCIPAL,
+      resource: defaultMcpResource,
+      sessionId: sessionResumer,
+      method: "POST",
+    }),
+  )) as Response;
+  expect(resumeResponse.status).toBe(200);
+  const body = (await resumeResponse.json()) as {
+    result?: { structuredContent?: { status?: string; executionId?: string } };
+  };
+  expect(body.result?.structuredContent?.status).toBe("execution_forbidden");
+  expect(body.result?.structuredContent?.executionId).toBe(executionId);
+
+  await sessions.close();
+});
+
 it("binds a paused workspace write to the resuming principal after demotion", async () => {
   const executor = await Effect.runPromise(
     createExecutor({ ...makeTestConfig(), orgWrites: "request" }),
