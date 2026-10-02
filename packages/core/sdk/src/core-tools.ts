@@ -25,6 +25,13 @@ import { HealthCheckResult, isToolSyncHealth } from "./health-check";
 import { ToolPolicyActionSchema } from "./policies";
 import type { Tool } from "./tool";
 import { ToolResult } from "./tool-result";
+import {
+  EnrollDeviceInput,
+  EnrollDeviceOutput,
+  SecretSinkRunOutput,
+  SecretSinkSignalInput,
+  rejectIfSecretShaped,
+} from "./secret-sink";
 
 const schemaToStandard = <A, I>(schema: Schema.Decoder<A, I>): StaticToolSchema<A, I> =>
   Schema.toStandardSchemaV1(Schema.toStandardJSONSchemaV1(schema) as never) as StaticToolSchema<
@@ -359,6 +366,12 @@ const OAuthProbeOutputStd = schemaToStandard(OAuthProbeOutput);
 const OAuthStartInputStd = schemaToStandard(OAuthStartInput);
 const OAuthStartOutputStd = schemaToStandard(OAuthStartOutput);
 const OAuthCancelInputStd = schemaToStandard(OAuthCancelInput);
+
+// Secret-sink schemas (FAKE-only scaffold)
+const SecretSinkSignalInputStd = schemaToStandard(SecretSinkSignalInput);
+const SecretSinkRunOutputStd = schemaToStandard(SecretSinkRunOutput);
+const EnrollDeviceInputStd = schemaToStandard(EnrollDeviceInput);
+const EnrollDeviceOutputStd = schemaToStandard(EnrollDeviceOutput);
 
 const connectionToOutput = (connection: Connection) => ({
   owner: connection.owner,
@@ -1065,6 +1078,56 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
               }),
               () => ({ removed: true }),
             ),
+        }),
+      ],
+    },
+    // -----------------------------------------------------------------------
+    // secretSink FAKE-only sketch — NO key minting, NO secrets, reviewable only
+    // -----------------------------------------------------------------------
+    {
+      id: "secretSink",
+      kind: "executor",
+      name: "Executor Secret Sink",
+      tools: [
+        tool({
+          name: "runOnBox",
+          description:
+            "FAKE-only scaffold. Validate a secret-sink signal (tailscale.join) and return a dry-run outcome. Never accepts or returns key material.",
+          inputSchema: SecretSinkSignalInputStd,
+          outputSchema: SecretSinkRunOutputStd,
+          execute: (input: typeof SecretSinkSignalInput.Type) =>
+            Effect.gen(function* () {
+              // Forbid secret-shaped keys/values anywhere in the payload.
+              const reject = yield* rejectIfSecretShaped(input);
+              if (reject != null) return reject;
+              // FAKE-only outcome: never claims a real join.
+              const out = {
+                joined: false,
+                hostname: input.hostname,
+                dryRun: input.dryRun,
+                nodeOnline: false,
+              } as const;
+              return out;
+            }),
+        }),
+        tool({
+          name: "enrollDevice",
+          description:
+            "FAKE-only scaffold. Record device enrollment without secrets. Returns an opaque credentialId reference; never returns key material.",
+          inputSchema: EnrollDeviceInputStd,
+          outputSchema: EnrollDeviceOutputStd,
+          execute: (input: typeof EnrollDeviceInput.Type) =>
+            Effect.gen(function* () {
+              const reject = yield* rejectIfSecretShaped(input);
+              if (reject != null) return reject;
+              // FAKE-only: synthesize a stable-looking opaque reference.
+              const credentialId = `fake-credential:${input.deviceId}`;
+              return {
+                ok: true,
+                deviceId: input.deviceId,
+                credentialId,
+              } as const;
+            }),
         }),
       ],
     },
