@@ -16,7 +16,7 @@ describe("secret-sink schemas and guards", () => {
       action: "tailscale.join",
       hostname: "dynamik-ops-grokbot",
       tags: ["tag:grok-ops"],
-      dryRun: true,
+      dryRun: true as const,
       authKeyFrom: {
         connection: "tailscale_api.user.dynamikTailscale",
         op: "keys.createKey",
@@ -40,12 +40,23 @@ describe("secret-sink schemas and guards", () => {
     expect(reject).toBeNull();
   });
 
+  it("rejects non-dryRun (false) in FAKE-only phase", async () => {
+    const invalid = {
+      action: "tailscale.join",
+      hostname: "box",
+      tags: ["tag:grok-ops"],
+      // @ts-expect-error - schema must reject false
+      dryRun: false,
+    };
+    await expect(Schema.decodeUnknown(SecretSinkSignalInput)(invalid)).rejects.toBeTruthy();
+  });
+
   it("rejects secret-shaped keys and values", async () => {
     const payload = {
       action: "tailscale.join",
       hostname: "box",
       tags: ["tag:grok-ops"],
-      dryRun: true,
+      dryRun: true as const,
       // Top-level forbidden
       authKey: "tskey-abcdef123456",
       // Nested forbidden
@@ -63,7 +74,7 @@ describe("secret-sink schemas and guards", () => {
   });
 
   it("models enrollment as opaque credential reference only", async () => {
-    const input = { deviceId: "dev-12345", fake: true };
+    const input = { deviceId: "dev-12345", fake: true as const };
     const decoded = await Schema.decodeUnknown(EnrollDeviceInput)(input);
     expect(decoded).toEqual(input);
     const out = await Schema.decodeUnknown(EnrollDeviceOutput)({
@@ -79,7 +90,7 @@ describe("secret-sink schemas and guards", () => {
     const out = await Schema.decodeUnknown(SecretSinkRunOutput)({
       joined: false,
       hostname: "box",
-      dryRun: true,
+      dryRun: true as const,
       nodeOnline: false,
     });
     expect(out.joined).toBe(false);

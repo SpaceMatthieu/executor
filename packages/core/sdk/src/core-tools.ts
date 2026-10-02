@@ -1104,7 +1104,8 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
               const out = {
                 joined: false,
                 hostname: input.hostname,
-                dryRun: input.dryRun,
+                // Force FAKE-only: always dryRun true regardless of input (which is also Literal true).
+                dryRun: true as const,
                 nodeOnline: false,
               } as const;
               return out;

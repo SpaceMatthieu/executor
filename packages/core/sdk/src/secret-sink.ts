@@ -33,7 +33,8 @@ export const SecretSinkSignalInput = Schema.Struct({
     Schema.minLength(1, { message: "hostname must be a non-empty string" }),
   ),
   tags: Schema.Array(TagSchema),
-  dryRun: Schema.Boolean,
+  // FAKE-only phase: dryRun must be true. Reject false.
+  dryRun: Schema.Literal(true),
   // Optional: model-visible source of truth for where the server SHOULD mint/resolve a key.
   // This is metadata only; the model never sees key material.
   authKeyFrom: Schema.optional(Schema.Union(AuthKeyFromConnectionSchema, AuthKeyFromOnePasswordSchema)),
@@ -52,8 +53,8 @@ export const EnrollDeviceInput = Schema.Struct({
       message: "deviceId must be URL-safe (letters, numbers, colon, dash, underscore)",
     }),
   ),
-  // For this FAKE-only scaffold we accept an explicit fake mode.
-  fake: Schema.optional(Schema.Boolean),
+  // FAKE-only gate: require explicit `fake: true` during this phase.
+  fake: Schema.Literal(true),
 });
 
 export const EnrollDeviceOutput = Schema.Struct({
